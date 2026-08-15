@@ -27,7 +27,6 @@ Before pushing any changes, you MUST ensure that any lint errors or simple test 
 
 * If you've made changes to the backend, you should run `pre-commit run --config ./dev_config/python/.pre-commit-config.yaml` (this will run on staged files).
 * If you've made changes to the frontend, you should run `cd frontend && npm run lint:fix && npm run build ; cd ..`
-* If you've made changes to the VSCode extension, you should run `cd openhands/app_server/integrations/vscode && npm run lint:fix && npm run compile ; cd ../../..`
 
 The pre-commit hooks MUST pass successfully before pushing any changes to the repository. This is a mandatory requirement to maintain code quality and consistency.
 
@@ -126,7 +125,7 @@ Backend:
 - The current V1 application server lives in `openhands/app_server/`. `make start-backend` still launches `openhands.server.listen:app`, which includes the V1 routes by default unless `ENABLE_V1=0`.
 - For V1 web-app docs, LLM setup should point users to the Settings UI.
 - Testing:
-  - All tests are in `tests/unit/test_*.py`
+  - Tests live under `tests/unit/`, mostly mirroring the `openhands/` source tree in subdirectories (e.g. `tests/unit/server/`, `tests/unit/app_server/`), each file named `test_*.py`
   - To test new code, run `poetry run pytest tests/unit/test_xxx.py` where `xxx` is the appropriate file for the current functionality
   - Write all tests with pytest
 
@@ -154,22 +153,6 @@ Frontend:
   - Architecture rule: UI components → TanStack Query hooks → Data Access Layer (`frontend/src/api`) → API endpoints
   - For SaaS organization management screens, prefer deriving the selected organization from `useOrganizations()` plus the selected org ID store instead of adding a dedicated single-org fetch when only list-level fields (for example `name`) are needed.
 
-
-VSCode Extension:
-- Located in the `openhands/app_server/integrations/vscode` directory
-- Setup: Run `npm install` in the extension directory
-- Linting:
-  - Run linting with fixes: `npm run lint:fix`
-  - Check only: `npm run lint`
-  - Type checking: `npm run typecheck`
-- Building:
-  - Compile TypeScript: `npm run compile`
-  - Package extension: `npm run package-vsix`
-- Testing:
-  - Run tests: `npm run test`
-- Development Best Practices:
-  - Use `vscode.window.createOutputChannel()` for debug logging instead of `showErrorMessage()` popups
-  - Pre-commit process runs both frontend and backend checks when committing extension changes
 
 ## Enterprise Directory
 
@@ -319,13 +302,14 @@ vi.mock("#/hooks/use-agent-state", () => ({
 }));
 ```
 
-### Microagents
+### Microagents / Skills
 
-Microagents are specialized prompts that enhance OpenHands with domain-specific knowledge and task-specific workflows. They are Markdown files that can include frontmatter for configuration.
+Microagents (V0 terminology) / Skills (V1 terminology) are specialized prompts that enhance OpenHands with domain-specific knowledge and task-specific workflows. They are Markdown files that can include frontmatter for configuration. The term used depends on which conversation version is running — see `skills/README.md` for the full terminology note — but both read from the same underlying files.
 
 #### Types:
-- **Public Microagents**: Located in `microagents/`, available to all users
-- **Repository Microagents**: Located in `.openhands/microagents/`, specific to this repository
+- **Public Skills/Microagents**: Located in `skills/` (this directory was previously named `microagents/`), available to all users
+- **Repository Microagents**: Located in `.openhands/microagents/`, specific to this repository (legacy `.openhands/skills/` is also read)
+- This repo's own Claude Code skills (for working on the OpenHands codebase itself, not shipped to end users) live in `.agents/skills/`
 
 #### Loading Behavior:
 - **Without frontmatter**: Always loaded into LLM context
@@ -345,13 +329,13 @@ Your specialized knowledge and instructions here...
 ### Frontend
 
 #### Action Handling:
-- Actions are defined in `frontend/src/types/action-type.ts`
-- The `HANDLED_ACTIONS` array in `frontend/src/state/chat-slice.ts` determines which actions are displayed as collapsible UI elements
+- The `ActionType` enum is defined in `frontend/src/types/action-type.tsx`; typed action/observation shapes live in `frontend/src/types/core/actions.ts` and `frontend/src/types/core/observations.ts`
+- Frontend state is Zustand-based (`frontend/src/stores/`, e.g. `event-message-store.ts`), not Redux — there is no `chat-slice.ts`
+- Rendering an event's chat-message title/details is handled by `getEventContent()` in `frontend/src/components/features/chat/event-content-helpers/get-event-content.tsx` (legacy conversations) and the V1 equivalent under `frontend/src/components/v1/chat/event-content-helpers/`
 - To add a new action type to the UI:
-  1. Add the action type to the `HANDLED_ACTIONS` array
-  2. Implement the action handling in `addAssistantAction` function in chat-slice.ts
-  3. Add a translation key in the format `ACTION_MESSAGE$ACTION_NAME` to the i18n files
-- Actions with `thought` property are displayed in the UI based on their action type:
+  1. Add a translation key in the format `ACTION_MESSAGE$ACTION_NAME` to the i18n files (`frontend/src/i18n/translation.json` + `declaration.ts`) — `getEventContent()` looks this key up automatically via `i18n.exists(actionKey)`
+  2. If the message needs custom formatting beyond simple `Trans` interpolation, extend `get-action-content.ts` / `get-observation-content.ts` in the same `event-content-helpers/` directory
+- Actions with a `thought` property are displayed in the UI based on their action type:
   - Regular actions (like "run", "edit") display the thought as a separate message
   - Special actions (like "think") are displayed as collapsible elements only
 
@@ -402,65 +386,13 @@ There are two main patterns for saving settings in the OpenHands frontend:
 
 ### Adding New LLM Models
 
-To add a new LLM model to OpenHands, you need to update multiple files across both frontend and backend:
+**The `openhands-sdk` package (pinned in `pyproject.toml`, from the separate `software-agent-sdk` repo) is now the single source of truth for verified models, verified providers, and bare-name-to-provider assignment** — the frontend no longer carries its own hardcoded model lists, and this repo's backend no longer has `openhands/cli/`, `openhands/llm/`, or `openhands/utils/` directories (that legacy code has moved out).
 
-#### Model Configuration Procedure:
-
-1. **Frontend Model Arrays** (`frontend/src/utils/verified-models.ts`):
-   - Add the model to `VERIFIED_MODELS` array (main list of all verified models)
-   - Add to provider-specific arrays based on the model's provider:
-     - `VERIFIED_OPENAI_MODELS` for OpenAI models
-     - `VERIFIED_ANTHROPIC_MODELS` for Anthropic models
-     - `VERIFIED_MISTRAL_MODELS` for Mistral models
-     - `VERIFIED_OPENHANDS_MODELS` for models available through OpenHands provider
-
-2. **Backend CLI Integration** (`openhands/cli/utils.py`):
-   - Add the model to the appropriate `VERIFIED_*_MODELS` arrays
-   - This ensures the model appears in CLI model selection
-
-3. **Backend Model List** (`openhands/utils/llm.py`):
-   - **CRITICAL**: Add the model to the `openhands_models` list (lines 57-66) if using OpenHands provider
-   - This is required for the model to appear in the frontend model selector
-   - Format: `'openhands/model-name'` (e.g., `'openhands/o3'`)
-
-4. **Backend LLM Configuration** (`openhands/llm/llm.py`):
-   - Add to feature-specific arrays based on model capabilities:
-     - `FUNCTION_CALLING_SUPPORTED_MODELS` if the model supports function calling
-     - `REASONING_EFFORT_SUPPORTED_MODELS` if the model supports reasoning effort parameters
-     - `CACHE_PROMPT_SUPPORTED_MODELS` if the model supports prompt caching
-     - `MODELS_WITHOUT_STOP_WORDS` if the model doesn't support stop words
-
-5. **Validation**:
-   - Run backend linting: `pre-commit run --config ./dev_config/python/.pre-commit-config.yaml`
-   - Run frontend linting: `cd frontend && npm run lint:fix`
-   - Run frontend build: `cd frontend && npm run build`
-
-#### Model Verification Arrays:
-
-- **VERIFIED_MODELS**: Main array of all verified models shown in the UI
-- **VERIFIED_OPENAI_MODELS**: OpenAI models (LiteLLM doesn't return provider prefix)
-- **VERIFIED_ANTHROPIC_MODELS**: Anthropic models (LiteLLM doesn't return provider prefix)
-- **VERIFIED_MISTRAL_MODELS**: Mistral models (LiteLLM doesn't return provider prefix)
-- **VERIFIED_OPENHANDS_MODELS**: Models available through OpenHands managed provider
-
-#### Model Feature Support Arrays:
-
-- **FUNCTION_CALLING_SUPPORTED_MODELS**: Models that support structured function calling
-- **REASONING_EFFORT_SUPPORTED_MODELS**: Models that support reasoning effort parameters (like o1, o3)
-- **CACHE_PROMPT_SUPPORTED_MODELS**: Models that support prompt caching for efficiency
-- **MODELS_WITHOUT_STOP_WORDS**: Models that don't support stop word parameters
-
-#### Frontend Model Integration:
-
-- Models are automatically available in the model selector UI once added to verified arrays
-- The `extractModelAndProvider` utility automatically detects provider from model arrays
-- Provider-specific models are grouped and prioritized in the UI selection
-
-#### CLI Model Integration:
-
-- Models appear in CLI provider selection based on the verified arrays
-- The `organize_models_and_providers` function groups models by provider
-- Default model selection prioritizes verified models for each provider
+- `openhands/app_server/utils/llm.py` re-exports `VERIFIED_MODELS`, `VERIFIED_OPENAI_MODELS`, `VERIFIED_ANTHROPIC_MODELS`, `VERIFIED_MISTRAL_MODELS`, and `VERIFIED_OPENHANDS_MODELS` from `openhands.sdk.llm.utils.verified_models` in the SDK package, then builds the `openhands/…`-prefixed model list and the `ModelsResponse` served at `GET /api/options/models`.
+- `openhands/app_server/config_api/default_llm_model_service.py` supplies the default model; SaaS mode can override the OpenHands-provider model list from the database instead of the SDK's static list.
+- The frontend (`frontend/src/api/option-service/option-service.api.ts`, types in `option.types.ts`) fetches `models`, `verified_models`, `verified_providers`, and `default_model` from that endpoint at runtime — there is no `frontend/src/utils/verified-models.ts` to edit.
+- To add or reclassify a model (verified status, function-calling/reasoning-effort/prompt-caching support, provider assignment), the change belongs in the `openhands-sdk` package (`software-agent-sdk` repo), not in this repo. See `.agents/skills/update-sdk/` for the workflow to pull in a new SDK version once such a change ships.
+- After bumping the SDK version here, validate with: backend linting (`pre-commit run --config ./dev_config/python/.pre-commit-config.yaml`), frontend linting (`cd frontend && npm run lint:fix`), and frontend build (`cd frontend && npm run build`).
 
 ### Environment Variable Enable Toggles
 
