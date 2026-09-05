@@ -30,7 +30,7 @@ from integrations.utils import (
     markdown_to_jira_markup,
 )
 from jinja2 import Environment, FileSystemLoader
-from server.auth.constants import JIRA_DC_ENABLE_OAUTH
+from server.auth.constants import JIRA_DC_BASE_URL, JIRA_DC_ENABLE_OAUTH
 from server.auth.saas_user_auth import get_user_auth_from_keycloak_id
 from server.auth.token_manager import TokenManager
 from storage.jira_dc_integration_store import JiraDcIntegrationStore
@@ -105,6 +105,31 @@ def _extract_workspace_hosts(payload: Dict) -> set[str]:
         for parsed in (urlparse(url) for url in _extract_workspace_urls(payload))
         if parsed.hostname
     }
+
+
+def _trusted_base_api_url(workspace: JiraDcWorkspace) -> str:
+    """Return the admin-configured Jira DC base API URL for ``workspace``.
+
+    SECURITY: this is the only place a ``base_api_url`` used to build an
+    outbound, service-account-authenticated request may be constructed.
+    ``workspace.name`` is the admin-configured hostname -- validated at
+    workspace-creation/OAuth-link time and matched against inbound webhook
+    payload hosts by ``validate_request_context`` -- never derived from
+    webhook payload content. Mirrors the trusted base-URL construction
+    already used for webhook (de)registration in
+    ``server/routes/integration/jira_dc.py`` (``JIRA_DC_BASE_URL`` in OAuth
+    mode, ``https://{workspace.name}`` otherwise).
+
+    Do not reintroduce deriving this value from webhook payload fields such
+    as ``issue.self``/``comment.self``. A webhook payload is
+    attacker-influenced input -- anyone who knows a workspace's
+    ``webhook_secret`` can set those fields to anything -- so using them to
+    pick the destination of a request that carries the service-account
+    Bearer token is an SSRF and credential-exfiltration vulnerability.
+    """
+    if JIRA_DC_ENABLE_OAUTH and JIRA_DC_BASE_URL:
+        return JIRA_DC_BASE_URL.rstrip('/')
+    return f'https://{workspace.name}'
 
 
 class JiraDcManager(Manager[JiraDcViewInterface]):
@@ -258,7 +283,12 @@ class JiraDcManager(Manager[JiraDcViewInterface]):
             issue_data = payload.get('issue', {})
             issue_id = issue_data.get('id')
             issue_key = issue_data.get('key')
-            base_api_url = issue_data.get('self', '').split('/rest/')[0]
+            # NOTE: issue.self is used only to derive workspace_name (a lookup
+            # key matched against a real, stored JiraDcWorkspace row below).
+            # It must NEVER be used to build base_api_url -- that value is
+            # filled in from the looked-up workspace by receive_message() /
+            # _trusted_base_api_url(), never from webhook payload content.
+            issue_self_url = issue_data.get('self', '')
 
             user_data = comment_data.get('author', {})
             user_email = user_data.get('emailAddress')
@@ -279,7 +309,12 @@ class JiraDcManager(Manager[JiraDcViewInterface]):
             issue_data = payload.get('issue', {})
             issue_id = issue_data.get('id')
             issue_key = issue_data.get('key')
-            base_api_url = issue_data.get('self', '').split('/rest/')[0]
+            # NOTE: issue.self is used only to derive workspace_name (a lookup
+            # key matched against a real, stored JiraDcWorkspace row below).
+            # It must NEVER be used to build base_api_url -- that value is
+            # filled in from the looked-up workspace by receive_message() /
+            # _trusted_base_api_url(), never from webhook payload content.
+            issue_self_url = issue_data.get('self', '')
 
             user_data = payload.get('user', {})
             user_email = user_data.get('emailAddress')
@@ -292,7 +327,7 @@ class JiraDcManager(Manager[JiraDcViewInterface]):
 
         workspace_name = ''
 
-        parsedUrl = urlparse(base_api_url)
+        parsedUrl = urlparse(issue_self_url)
         if parsedUrl.hostname:
             workspace_name = parsedUrl.hostname
 
@@ -304,7 +339,6 @@ class JiraDcManager(Manager[JiraDcViewInterface]):
                 display_name,
                 user_key,
                 workspace_name,
-                base_api_url,
             ]
         ):
             return None
@@ -317,7 +351,13 @@ class JiraDcManager(Manager[JiraDcViewInterface]):
             display_name=display_name,
             platform_user_id=user_key,
             workspace_name=workspace_name,
-            base_api_url=base_api_url,
+            # base_api_url is intentionally left unset (defaults to '').
+            # SECURITY: it must never be derived from webhook payload content
+            # (that was the SSRF / credential-exfiltration vulnerability this
+            # function used to have via issue_data['self']). receive_message()
+            # fills it in from the looked-up, admin-configured
+            # JiraDcWorkspace via _trusted_base_api_url() before any
+            # outbound, service-account-authenticated call is made.
             comment_id=comment_id or '',
         )
 
@@ -343,6 +383,12 @@ class JiraDcManager(Manager[JiraDcViewInterface]):
                 None,
             )
             return
+
+        # SECURITY: base_api_url must come from the workspace's own stored,
+        # admin-configured host -- never from webhook payload content. This
+        # overwrites the '' placeholder parse_webhook() left on job_context.
+        # See _trusted_base_api_url() for why.
+        job_context.base_api_url = _trusted_base_api_url(workspace)
 
         try:
             service_account = resolve_jira_dc_service_account(

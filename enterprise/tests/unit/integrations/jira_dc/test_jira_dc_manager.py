@@ -458,7 +458,15 @@ class TestParseWebhook:
         assert job_context.user_email == 'user@company.com'
         assert job_context.display_name == 'Test User'
         assert job_context.workspace_name == 'jira.company.com'
-        assert job_context.base_api_url == 'https://jira.company.com'
+        # SECURITY: parse_webhook() must never populate base_api_url from
+        # webhook payload content -- that was the SSRF / credential
+        # exfiltration vulnerability (issue.self was trusted verbatim as the
+        # destination for the service-account Bearer token). It is left at
+        # its default here; receive_message() fills it in afterwards from the
+        # looked-up, trusted JiraDcWorkspace. See
+        # TestBaseApiUrlSecurity below and _trusted_base_api_url() in
+        # jira_dc_manager.py.
+        assert job_context.base_api_url == ''
 
     def test_parse_webhook_comment_without_mention(self, jira_dc_manager):
         """Test parsing comment without @openhands mention."""
@@ -579,6 +587,46 @@ class TestParseWebhook:
 
         job_context = jira_dc_manager.parse_webhook(payload)
         assert job_context is None
+
+    def test_parse_webhook_never_populates_base_api_url_from_payload(
+        self, jira_dc_manager
+    ):
+        """parse_webhook() must not surface an attacker-controlled base_api_url.
+
+        ``issue.self`` is attacker-influenced input -- anyone who can forge a
+        validly-signed webhook for a workspace (or who has learned its
+        ``webhook_secret``) fully controls it. It may only be used to derive
+        a *lookup key* (``workspace_name``); it must never become the
+        destination for an outbound, service-account-authenticated request.
+        This is the SSRF / credential-exfiltration regression this test
+        guards against.
+        """
+        payload = {
+            'webhookEvent': 'comment_created',
+            'comment': {
+                'body': 'Please fix this @openhands',
+                'author': {
+                    'emailAddress': 'user@company.com',
+                    'displayName': 'Test User',
+                    'key': 'testuser',
+                },
+            },
+            'issue': {
+                'id': '12345',
+                'key': 'PROJ-123',
+                'self': 'http://attacker.example/evil/rest/api/2/issue/12345',
+            },
+        }
+
+        job_context = jira_dc_manager.parse_webhook(payload)
+
+        assert job_context is not None
+        # workspace_name is only ever used as a lookup key against a real,
+        # stored JiraDcWorkspace row -- a forged value simply fails to match
+        # one, so it is fine for it to reflect the payload's host candidate.
+        assert job_context.workspace_name == 'attacker.example'
+        # base_api_url must NEVER be populated from payload content.
+        assert job_context.base_api_url == ''
 
 
 class TestReceiveMessage:
@@ -828,6 +876,141 @@ class TestReceiveMessage:
             await jira_dc_manager.receive_message(message)
 
             jira_dc_manager._send_error_comment.assert_called_once()
+
+
+class TestBaseApiUrlSecurity:
+    """Regression tests for the SSRF / credential-exfiltration fix.
+
+    ``base_api_url`` must always be built from the stored, admin-configured
+    ``JiraDcWorkspace`` (see ``_trusted_base_api_url()``), never from webhook
+    payload content such as ``issue.self``. Before the fix, a forged
+    ``issue.self`` became the literal destination of outbound requests that
+    carried the workspace's service-account Bearer token.
+    """
+
+    @pytest.mark.asyncio
+    async def test_receive_message_ignores_forged_issue_self_url(
+        self,
+        jira_dc_manager,
+        mock_token_manager,
+        sample_jira_dc_workspace,
+        sample_jira_dc_user,
+        sample_user_auth,
+    ):
+        """A forged issue.self must never become the destination of the
+        outbound, service-account-authenticated Jira API call.
+
+        Simulates an attacker who knows (or owns) a workspace's
+        ``webhook_secret`` and can therefore produce a validly-signed
+        webhook, but sets ``issue.self`` to an attacker-controlled/internal
+        URL to try to redirect the service-account Bearer token there (SSRF
+        + credential exfiltration).
+        """
+        mock_token_manager.decrypt_text.return_value = 'decrypted-svc-acc-pat'
+
+        malicious_payload = {
+            'webhookEvent': 'comment_created',
+            'comment': {
+                'body': 'Please fix this @openhands',
+                'author': {
+                    'emailAddress': 'user@company.com',
+                    'displayName': 'Test User',
+                    'key': 'testuser',
+                },
+            },
+            'issue': {
+                'id': '12345',
+                'key': 'PROJ-123',
+                # Attacker-controlled destination (an internal/cloud-metadata
+                # style target). Before the fix this string became
+                # job_context.base_api_url verbatim.
+                'self': 'http://169.254.169.254/evil/rest/api/2/issue/12345',
+            },
+        }
+
+        jira_dc_manager.integration_store.get_workspace_by_name.return_value = (
+            sample_jira_dc_workspace
+        )
+        jira_dc_manager.authenticate_user = AsyncMock(
+            return_value=(sample_jira_dc_user, sample_user_auth)
+        )
+        # Short-circuit right after the issue-context HTTP calls we're
+        # asserting on; nothing past this point is relevant to the fix.
+        jira_dc_manager.is_job_requested = AsyncMock(return_value=False)
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            'fields': {'summary': 'Title', 'description': 'Description'}
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with (
+            patch('integrations.jira_dc.jira_dc_manager.JIRA_DC_ENABLE_OAUTH', False),
+            patch('httpx.AsyncClient') as mock_client,
+        ):
+            mock_get = AsyncMock(return_value=mock_response)
+            mock_client.return_value.__aenter__.return_value.get = mock_get
+
+            message = Message(
+                source=SourceType.JIRA_DC,
+                message={'payload': malicious_payload},
+            )
+            await jira_dc_manager.receive_message(message)
+
+        # get_issue_details() + get_issue_comments() both fire; every one of
+        # them must target the workspace's own stored/trusted host, never
+        # the attacker's URL from the payload.
+        assert mock_get.await_count == 2
+        for call in mock_get.await_args_list:
+            called_url = call.args[0]
+            assert called_url.startswith('https://jira.company.com/'), called_url
+            assert '169.254.169.254' not in called_url
+            assert 'evil' not in called_url
+
+    @pytest.mark.asyncio
+    async def test_receive_message_sets_trusted_base_api_url_on_job_context(
+        self,
+        jira_dc_manager,
+        sample_comment_webhook_payload,
+        sample_jira_dc_workspace,
+        sample_jira_dc_user,
+        sample_user_auth,
+    ):
+        """job_context.base_api_url is overwritten with the trusted URL.
+
+        Even for a well-formed, non-malicious payload, the value used from
+        this point on must be the one derived from the stored workspace
+        (``_trusted_base_api_url``), not whatever parse_webhook() left there.
+        """
+        jira_dc_manager.integration_store.get_workspace_by_name.return_value = (
+            sample_jira_dc_workspace
+        )
+        jira_dc_manager.authenticate_user = AsyncMock(
+            return_value=(sample_jira_dc_user, sample_user_auth)
+        )
+
+        captured_job_context = {}
+
+        async def _capture_get_issue_details(job_context, svc_acc_api_key):
+            captured_job_context['job_context'] = job_context
+            return 'Test Title', 'Test Description'
+
+        jira_dc_manager.get_issue_details = AsyncMock(
+            side_effect=_capture_get_issue_details
+        )
+        jira_dc_manager.is_job_requested = AsyncMock(return_value=False)
+
+        with patch('integrations.jira_dc.jira_dc_manager.JIRA_DC_ENABLE_OAUTH', False):
+            message = Message(
+                source=SourceType.JIRA_DC,
+                message={'payload': sample_comment_webhook_payload},
+            )
+            await jira_dc_manager.receive_message(message)
+
+        assert captured_job_context['job_context'].base_api_url == (
+            'https://jira.company.com'
+        )
 
 
 class TestIsJobRequested:
