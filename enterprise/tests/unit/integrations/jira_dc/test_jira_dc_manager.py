@@ -1374,6 +1374,10 @@ class TestGetIssueDetails:
         X-AUSERNAME), a silently-rejected PAT is indistinguishable from a permission
         error — operators cannot tell if the token was wrong, the user has no app
         access, or the instance only accepts a different auth scheme.
+
+        The PAT value itself (not even a prefix of it) must never appear in the
+        log record — see test_get_issue_details_401_log_never_contains_pat_material
+        for that guarantee.
         """
         # Arrange
         pat = 'OdC2NTPATfullValueXyz123456789'
@@ -1403,18 +1407,89 @@ class TestGetIssueDetails:
             with pytest.raises(httpx.HTTPStatusError):
                 await jira_dc_manager.get_issue_details(sample_job_context, pat)
 
-        # Assert: log fires once, and carries every field operators need.
+        # Assert: log fires once, and carries every non-sensitive field operators
+        # need -- but NOT any fragment of the PAT itself (see SECURITY note below
+        # and the dedicated no-PAT-material test).
         mock_logger.error.assert_called_once()
         format_string, *log_args = mock_logger.error.call_args.args
         assert log_args == [
             f'{sample_job_context.base_api_url}/rest/api/2/issue/{sample_job_context.issue_key}',
             len(pat),
-            pat[:6],
             'OAuth realm="https%3A%2F%2Fjira.example.com"',
             'AUTHENTICATED_FAILED',
             'anonymous',
             '{"errorMessages":["Login Required"]}',
         ]
+        # SECURITY (regression guard): the PAT prefix must never be a log arg.
+        assert pat[:6] not in log_args
+        assert pat not in log_args
+
+    @pytest.mark.asyncio
+    async def test_get_issue_details_401_log_never_contains_pat_material(
+        self, jira_dc_manager, sample_job_context
+    ):
+        """No substring of the service-account PAT may appear in the 401 log.
+
+        Regression test for the vulnerability where ``svc_acc_api_key[:6]`` was
+        logged alongside the 401 diagnostic headers on every failed Jira DC API
+        call. Log storage/aggregation access exposes whatever lands here, so
+        even a short prefix narrows the secret space for a credential that must
+        never be logged in any partial form. Uses a distinctive fake key so we
+        can assert its absence precisely (not just the absence of a 6-char
+        prefix, which the fixed code no longer computes at all).
+        """
+        # Arrange: a long, distinctive PAT so any leaked substring is easy to
+        # detect and couldn't plausibly collide with other log content.
+        distinctive_pat = 'ZzTotallyUniquePatValue9876543210AbCdEf'
+        mock_response = MagicMock()
+        mock_response.status_code = 401
+        mock_response.headers = {
+            'WWW-Authenticate': 'OAuth realm="https%3A%2F%2Fjira.example.com"',
+            'X-Seraph-LoginReason': 'AUTHENTICATED_FAILED',
+            'X-AUSERNAME': 'anonymous',
+        }
+        mock_response.text = '{"errorMessages":["Login Required"]}'
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "Client error '401 Unauthorized'",
+            request=MagicMock(),
+            response=mock_response,
+        )
+
+        with (
+            patch('httpx.AsyncClient') as mock_client,
+            patch('integrations.jira_dc.jira_dc_manager.logger') as mock_logger,
+        ):
+            mock_client.return_value.__aenter__.return_value.get = AsyncMock(
+                return_value=mock_response
+            )
+
+            # Act
+            with pytest.raises(httpx.HTTPStatusError):
+                await jira_dc_manager.get_issue_details(
+                    sample_job_context, distinctive_pat
+                )
+
+        # Assert: the log fires (diagnostics still useful)...
+        mock_logger.error.assert_called_once()
+        format_string, *log_args = mock_logger.error.call_args.args
+
+        # ...but the rendered log message contains no substring of the PAT --
+        # not the full value, not a prefix of any length.
+        rendered_message = format_string % tuple(log_args)
+        assert distinctive_pat not in rendered_message
+        for prefix_len in range(1, len(distinctive_pat) + 1):
+            assert distinctive_pat[:prefix_len] not in rendered_message
+
+        # And the non-sensitive diagnostic content is still present.
+        assert (
+            f'{sample_job_context.base_api_url}/rest/api/2/issue/{sample_job_context.issue_key}'
+            in rendered_message
+        )
+        assert str(len(distinctive_pat)) in rendered_message
+        assert 'OAuth realm="https%3A%2F%2Fjira.example.com"' in rendered_message
+        assert 'AUTHENTICATED_FAILED' in rendered_message
+        assert 'anonymous' in rendered_message
+        assert '{"errorMessages":["Login Required"]}' in rendered_message
 
 
 class TestSendMessage:

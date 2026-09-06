@@ -1,5 +1,6 @@
 """Unit tests for GitLab integration routes."""
 
+import hmac
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,6 +13,7 @@ from server.routes.integration.gitlab import (
     ResourceIdentifier,
     get_gitlab_resources,
     reinstall_gitlab_webhook,
+    verify_gitlab_signature,
 )
 from storage.gitlab_webhook import GitlabWebhook
 
@@ -59,6 +61,138 @@ def mock_webhook():
     webhook.webhook_uuid = 'test-uuid'
     webhook.last_synced = None
     return webhook
+
+
+class TestVerifyGitlabSignature:
+    """Test cases for verify_gitlab_signature.
+
+    Covers the constant-time signature comparison fix: the webhook secret
+    check must go through ``hmac.compare_digest`` rather than a plain ``!=``,
+    matching the pattern already used by the GitHub and Jira Cloud webhook
+    handlers in this codebase.
+    """
+
+    @pytest.mark.asyncio
+    async def test_valid_signature_is_accepted(self):
+        """A header secret matching the stored secret must be accepted."""
+        with (
+            patch('server.routes.integration.gitlab.IS_LOCAL_DEPLOYMENT', False),
+            patch('server.routes.integration.gitlab.webhook_store') as mock_store,
+        ):
+            mock_store.get_webhook_secret = AsyncMock(return_value='the-real-secret')
+
+            # Should not raise.
+            await verify_gitlab_signature(
+                header_webhook_secret='the-real-secret',
+                webhook_uuid='hook-uuid',
+                user_id='user-1',
+            )
+
+    @pytest.mark.asyncio
+    async def test_invalid_signature_is_rejected(self):
+        """A header secret that does not match the stored secret is rejected.
+
+        This is the core behavioral contract of verify_gitlab_signature and
+        must hold whether the comparison is done via `!=` or
+        `hmac.compare_digest` -- the constant-time fix must not change what
+        counts as a match.
+        """
+        with (
+            patch('server.routes.integration.gitlab.IS_LOCAL_DEPLOYMENT', False),
+            patch('server.routes.integration.gitlab.webhook_store') as mock_store,
+        ):
+            mock_store.get_webhook_secret = AsyncMock(return_value='the-real-secret')
+
+            with pytest.raises(HTTPException) as exc_info:
+                await verify_gitlab_signature(
+                    header_webhook_secret='an-attacker-supplied-value',
+                    webhook_uuid='hook-uuid',
+                    user_id='user-1',
+                )
+
+        assert exc_info.value.status_code == 403
+        assert "didn't match" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_missing_stored_secret_is_rejected(self):
+        """No stored webhook secret for the uuid/user must also be rejected."""
+        with (
+            patch('server.routes.integration.gitlab.IS_LOCAL_DEPLOYMENT', False),
+            patch('server.routes.integration.gitlab.webhook_store') as mock_store,
+        ):
+            mock_store.get_webhook_secret = AsyncMock(return_value=None)
+
+            with pytest.raises(HTTPException) as exc_info:
+                await verify_gitlab_signature(
+                    header_webhook_secret='anything',
+                    webhook_uuid='hook-uuid',
+                    user_id='user-1',
+                )
+
+        assert exc_info.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_missing_required_headers_rejected_before_secret_lookup(self):
+        """Missing header/uuid/user_id is rejected without a secret lookup."""
+        with patch('server.routes.integration.gitlab.webhook_store') as mock_store:
+            with pytest.raises(HTTPException) as exc_info:
+                await verify_gitlab_signature(
+                    header_webhook_secret='',
+                    webhook_uuid='hook-uuid',
+                    user_id='user-1',
+                )
+
+        assert exc_info.value.status_code == 403
+        mock_store.get_webhook_secret.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_comparison_uses_hmac_compare_digest(self):
+        """Regression guard for the timing side-channel fix.
+
+        The secret check must go through `hmac.compare_digest` (constant-time)
+        rather than Python's plain `!=` (short-circuits on the first
+        mismatched byte), matching how `github.py` and `jira.py` already
+        verify their own webhook signatures in this codebase.
+        """
+        with (
+            patch('server.routes.integration.gitlab.IS_LOCAL_DEPLOYMENT', False),
+            patch('server.routes.integration.gitlab.webhook_store') as mock_store,
+            patch(
+                'server.routes.integration.gitlab.hmac.compare_digest',
+                wraps=hmac.compare_digest,
+            ) as mock_compare_digest,
+        ):
+            mock_store.get_webhook_secret = AsyncMock(return_value='the-real-secret')
+
+            await verify_gitlab_signature(
+                header_webhook_secret='the-real-secret',
+                webhook_uuid='hook-uuid',
+                user_id='user-1',
+            )
+
+        mock_compare_digest.assert_called_once_with(
+            'the-real-secret', 'the-real-secret'
+        )
+
+    @pytest.mark.asyncio
+    async def test_local_deployment_uses_fixed_test_secret(self):
+        """Local deployment compares against the well-known local test token."""
+        with patch('server.routes.integration.gitlab.IS_LOCAL_DEPLOYMENT', True):
+            # Correct local token is accepted without touching the DB-backed store.
+            await verify_gitlab_signature(
+                header_webhook_secret='localdeploymentwebhooktesttoken',
+                webhook_uuid='hook-uuid',
+                user_id='user-1',
+            )
+
+            with pytest.raises(HTTPException) as exc_info:
+                await verify_gitlab_signature(
+                    header_webhook_secret='wrong-token',
+                    webhook_uuid='hook-uuid',
+                    user_id='user-1',
+                )
+
+        assert exc_info.value.status_code == 403
 
 
 class TestGetGitLabResources:

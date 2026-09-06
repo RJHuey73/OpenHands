@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import hmac
 import json
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
@@ -75,7 +76,9 @@ async def verify_gitlab_signature(
             webhook_uuid=webhook_uuid, user_id=user_id
         )
 
-    if not webhook_secret or header_webhook_secret != webhook_secret:
+    if not webhook_secret or not hmac.compare_digest(
+        header_webhook_secret, webhook_secret
+    ):
         raise HTTPException(status_code=403, detail="Request signatures didn't match!")
 
 

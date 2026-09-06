@@ -589,13 +589,18 @@ class JiraDcManager(Manager[JiraDcViewInterface]):
         async with httpx.AsyncClient(verify=httpx_verify_option()) as client:
             response = await client.get(url, headers=headers)
             if response.status_code == 401:
+                # SECURITY: never log any fragment of svc_acc_api_key (not even a
+                # prefix) -- log storage/aggregation access would otherwise expose
+                # partial PAT material, narrowing the secret space for a credential
+                # that should never be logged even partially. PAT length is fine
+                # (it doesn't narrow the keyspace); the actual token content must not
+                # appear here in any form.
                 logger.error(
-                    '[Jira DC] 401 from %s. PAT length=%d prefix=%s '
+                    '[Jira DC] 401 from %s. PAT length=%d '
                     'WWW-Authenticate=%r X-Seraph-LoginReason=%r '
                     'X-AUSERNAME=%r body=%s',
                     url,
                     len(svc_acc_api_key),
-                    svc_acc_api_key[:6] if svc_acc_api_key else '',
                     response.headers.get('WWW-Authenticate'),
                     response.headers.get('X-Seraph-LoginReason'),
                     response.headers.get('X-AUSERNAME'),
