@@ -260,3 +260,6 @@ runtime_*.tar
 test-results
 .sessions
 .eval_sessions
+
+# CI verification touch (no-op) — confirms CI runs after enabling GitHub Actions on this fork.
+
